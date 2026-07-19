@@ -42,9 +42,9 @@ Options:
   -x, --hash           Compare files by hash instead of byte-for-byte cmp
   -a, --algo ALGO      Hash algorithm: md5sum|sha1sum|sha256sum|sha512sum|b2sum
                        (default: sha256sum)
-      --min-size SIZE  Only hash-compare files >= SIZE (e.g., 500b, 2kb, 10mib, 1gb)
+      --min-size SIZE  Only hash-compare files >= SIZE (e.g., 500B, 2KB, 10MiB, 1GB)
                        (smaller files use cmp)
-      --max-size SIZE  Only hash-compare files <= SIZE (e.g., 100mb, 2gib)
+      --max-size SIZE  Only hash-compare files <= SIZE (e.g., 100MB, 2GiB)
                        (larger files use cmp)
       --max-find-time T Max time allowed for find search per file (e.g., 5s, 2m, 1h)
   -r, --find-renamed   If a file is missing in DIR2 — search DIR2 for a
@@ -57,19 +57,19 @@ EOF
 # Parsers (Size & Time)    #
 ############################
 
-# Конвертирует человекочитаемый размер в байты
+# Converts human-readable size to bytes
 parse_size() {
   local val="$1"
-  # Приводим к нижнему регистру для простоты парсинга
+  # Convert to lowercase
   local clean=$(echo "$val" | tr '[:upper:]' '[:lower:]' | xargs)
 
-  # Проверяем, если это чистое число
+  # Check for plain number
   if [[ "$clean" =~ ^[0-9]+$ ]]; then
     echo "$clean"
     return 0
   fi
 
-  # Регулярное выражение для разделения числа и суффикса
+  # Regex for number/suffix
   if [[ "$clean" =~ ^([0-9]+)([a-z]+)$ ]]; then
     local num="${BASH_REMATCH[1]}"
     local unit="${BASH_REMATCH[2]}"
@@ -88,18 +88,18 @@ parse_size() {
     ti | tib) factor=1099511627776 ;;
     pi | pib) factor=1125899906842624 ;;
     *)
-      echo "Ошибка: Неизвестный суффикс размера '$unit' в параметре '$val'" >&2
+      echo "Error: Unknown size suffix '$unit' in argument '$val'" >&2
       exit 1
       ;;
     esac
     echo $((num * factor))
   else
-    echo "Ошибка: Неверный формат размера '$val'" >&2
+    echo "Error: Invalid size format '$val'" >&2
     exit 1
   fi
 }
 
-# Конвертирует человекочитаемое время в секунды
+# Converts human-readable time to seconds
 parse_time() {
   local val="$1"
   local clean=$(echo "$val" | tr '[:upper:]' '[:lower:]' | xargs)
@@ -121,13 +121,13 @@ parse_time() {
     d) factor=86400 ;;
     w) factor=604800 ;;
     *)
-      echo "Ошибка: Неизвестный суффикс времени '$unit' в параметре '$val'" >&2
+      echo "Error: Unknown time suffix '$unit' in argument '$val'" >&2
       exit 1
       ;;
     esac
     echo $((num * factor))
   else
-    echo "Ошибка: Неверный формат времени '$val'" >&2
+    echo "Error: Invalid time format '$val'" >&2
     exit 1
   fi
 }
@@ -292,7 +292,7 @@ status_line() {
   fi
 }
 
-# Спиннер принимает дополнительный режим для кастомизации вывода статуса
+# Spinner supports custom status mode
 spinner() {
   local msg="$1" color="$2" mode="${3:-default}"
   while :; do
@@ -367,7 +367,7 @@ compare_files() {
   cmp -s "$f1" "$f2"
 }
 
-# find_renamed FILE1 -> ищет дубликат с учетом таймаута
+# find_renamed FILE1 -> search duplicate with timeout
 find_renamed() {
   local f1="$1" cand target_sum=""
   local start_time=$(date +%s)
@@ -375,7 +375,7 @@ find_renamed() {
   $HASH_MODE && target_sum="$(hash_of "$f1")"
 
   while IFS= read -r -d '' cand; do
-    # Проверка ограничения по времени поиска
+    # Search timeout check
     if ((MAX_FIND_TIME > 0)); then
       local current_time=$(date +%s)
       if ((current_time - start_time >= MAX_FIND_TIME)); then
@@ -417,7 +417,7 @@ for ((INDEX = 0; INDEX < TOTAL; INDEX++)); do
   #########################################
   if [[ ! -f "$FILE2" ]]; then
     if $FIND_RENAMED; then
-      # Вызываем спиннер с флагом "finding" для вывода [ finding / ]
+      # Start spinner with "finding" to display [ finding / ]
       spinner "Find $REL" "$CYAN" "finding" &
       SPID=$!
       FOUND="$(find_renamed "$FILE1" || true)"
