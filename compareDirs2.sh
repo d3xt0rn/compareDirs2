@@ -14,7 +14,7 @@ RESET='\033[0m'
 GREEN='\033[1;32m'
 RED='\033[1;31m'
 BLUE='\033[1;34m'
-YELLOW='\033[1;33m' # используется как "orange"
+YELLOW='\033[1;33m' # used as "orange"
 CYAN='\033[1;36m'
 WHITE='\033[1;37m'
 
@@ -38,16 +38,16 @@ usage() {
 Usage: $0 [OPTIONS] DIR1 DIR2
 
 Options:
-  -x, --hash              Сравнивать файлы по хешу вместо побайтового cmp
-  -a, --algo ALGO         Алгоритм хеша: md5sum|sha1sum|sha256sum|sha512sum|b2sum
-                          (по умолчанию: sha256sum)
-      --min-size BYTES    Хешем сравнивать только файлы >= BYTES
-                          (файлы меньше — через cmp)
-      --max-size BYTES    Хешем сравнивать только файлы <= BYTES
-                          (файлы больше — через cmp)
-  -r, --find-renamed      Если файл отсутствует в DIR2 — искать в DIR2
-                          файл с идентичным содержимым/хешем (детект переименований)
-  -h, --help              Показать эту справку
+  -x, --hash              Compare files by hash instead of byte-for-byte cmp
+  -a, --algo ALGO         Hash algorithm: md5sum|sha1sum|sha256sum|sha512sum|b2sum
+                          (default: sha256sum)
+      --min-size BYTES    Only hash-compare files >= BYTES
+                          (smaller files use cmp)
+      --max-size BYTES    Only hash-compare files <= BYTES
+                          (larger files use cmp)
+  -r, --find-renamed      If a file is missing in DIR2 — search DIR2 for a
+                          file with identical content/hash (rename detection)
+  -h, --help              Show this help
 EOF
 }
 
@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
     break
     ;;
   -*)
-    echo "Неизвестная опция: $1" >&2
+    echo "Unknown option: $1" >&2
     usage
     exit 1
     ;;
@@ -108,11 +108,11 @@ DIR1="${1%/}"
 DIR2="${2%/}"
 
 if [[ ! -d "$DIR1" ]]; then
-  echo "Директория не найдена: $DIR1" >&2
+  echo "Directory not found: $DIR1" >&2
   exit 1
 fi
 if [[ ! -d "$DIR2" ]]; then
-  echo "Директория не найдена: $DIR2" >&2
+  echo "Directory not found: $DIR2" >&2
   exit 1
 fi
 
@@ -122,12 +122,12 @@ if $HASH_MODE; then
     [[ "$HASH_ALGO" == "$a" ]] && valid=true
   done
   if ! $valid; then
-    echo "Неподдерживаемый алгоритм хеша: $HASH_ALGO" >&2
-    echo "Доступные: ${ALLOWED_ALGOS[*]}" >&2
+    echo "Unsupported hash algorithm: $HASH_ALGO" >&2
+    echo "Available: ${ALLOWED_ALGOS[*]}" >&2
     exit 1
   fi
   if ! command -v "$HASH_ALGO" >/dev/null 2>&1; then
-    echo "Утилита $HASH_ALGO не найдена в системе." >&2
+    echo "Utility $HASH_ALGO not found on this system." >&2
     exit 1
   fi
 fi
@@ -136,7 +136,7 @@ fi
 # Terminal / Status column #
 ############################
 TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
-# ширина обновляется при ресайзе терминала, без лишних форков tput на каждый кадр
+# width is refreshed on terminal resize, no extra tput forks per frame
 trap 'TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)' WINCH
 
 OK_COUNT=0
@@ -146,13 +146,13 @@ SPID=""
 INDEX=0
 TOTAL=0
 FILES=()
-LAST_LINES=1 # сколько строк занимает текущий незавершённый статус (1 или 2)
+LAST_LINES=1 # how many lines the current in-progress status occupies (1 or 2)
 
 filesize() {
   stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
 }
 
-# стирает предыдущий вывод статуса (учитывая перенос на 2 строки)
+# clears the previous status output (accounting for 2-line wrap)
 clear_status() {
   if ((LAST_LINES > 1)); then
     printf '\033[%dA' "$((LAST_LINES - 1))"
@@ -160,7 +160,7 @@ clear_status() {
   printf '\r\033[J'
 }
 
-# закрывает текущий статус реальным переводом строки и сбрасывает состояние
+# closes the current status with a real newline and resets state
 finish_line() {
   echo
   LAST_LINES=1
@@ -168,11 +168,11 @@ finish_line() {
 
 # status_line PREFIX PREFIX_COLOR MESSAGE STATUS STATUS_COLOR
 #
-# В зависимости от ширины терминала:
-#   - если помещается целиком  -> одна строка, как обычно
-#   - если само имя помещается, а статус справа - нет -> статус переносится
-#     на следующую строку с отступом
-#   - если не помещается даже имя -> имя обрезается спереди ("...хвост")
+# Depending on terminal width:
+#   - fits entirely  -> single line, as usual
+#   - the name fits but the status on the right doesn't -> status wraps
+#     to the next line with indentation
+#   - even the name doesn't fit -> name is truncated from the front ("...tail")
 status_line() {
   local prefix="$1" pcolor="$2" msg="$3" status="$4" scolor="$5"
   local status_len=${#status}
@@ -182,7 +182,7 @@ status_line() {
   clear_status
 
   if ((TERM_WIDTH >= msglen + fixed + 2)); then
-    # всё влезает в одну строку
+    # everything fits on one line
     local pad=$((TERM_WIDTH - msglen - fixed))
     ((pad < 1)) && pad=1
     printf "%b%s%b %s%*s%b[%b %b%s%b %b]%b" \
@@ -193,7 +193,7 @@ status_line() {
       "$BLUE" "$RESET"
     LAST_LINES=1
   elif ((TERM_WIDTH >= msglen + 2)); then
-    # имя целиком влезает, статус переносим на следующую строку с отступом
+    # the name fits, wrap the status to the next line with indentation
     printf "%b%s%b %s\n" "$pcolor" "$prefix" "$RESET" "$msg"
     printf "    %b[%b %b%s%b %b]%b" \
       "$BLUE" "$RESET" \
@@ -201,7 +201,7 @@ status_line() {
       "$BLUE" "$RESET"
     LAST_LINES=2
   else
-    # терминал совсем узкий — обрезаем имя спереди
+    # terminal is too narrow — truncate the name from the front
     local maxmsg=$((TERM_WIDTH - fixed - 2))
     ((maxmsg < 5)) && maxmsg=5
     if ((msglen > maxmsg)); then
@@ -251,8 +251,8 @@ on_interrupt() {
     finish_line
     UNCHECKED_COUNT=$((UNCHECKED_COUNT + 1))
   done
-  printf "\n%b*%b Прервано пользователем.\n" "$RED" "$RESET"
-  printf "%b*%b OK: %d  Ошибок: %d  Непроверено: %d\n" \
+  printf "\n%b*%b Interrupted by user.\n" "$RED" "$RESET"
+  printf "%b*%b OK: %d  Errors: %d  Unchecked: %d\n" \
     "$BLUE" "$RESET" "$OK_COUNT" "$ERR_COUNT" "$UNCHECKED_COUNT"
   exit 130
 }
@@ -280,7 +280,7 @@ compare_files() {
   cmp -s "$f1" "$f2"
 }
 
-# find_renamed FILE1 -> печатает путь найденного файла в stdout, код возврата 0/1
+# find_renamed FILE1 -> prints the found file path to stdout, returns 0/1
 find_renamed() {
   local f1="$1" cand target_sum=""
   $HASH_MODE && target_sum="$(hash_of "$f1")"
@@ -326,15 +326,15 @@ for ((INDEX = 0; INDEX < TOTAL; INDEX++)); do
       if [[ -n "$FOUND" ]]; then
         status_line "*" "$GREEN" "Find $REL" "found" "$GREEN"
         finish_line
-        printf "%b*%b Похоже, файл был переименован/перемещён:\n" "$GREEN" "$RESET"
-        printf "    Найден как: %s\n\n" "$FOUND"
+        printf "%b*%b Looks like the file was renamed/moved:\n" "$GREEN" "$RESET"
+        printf "    Found as: %s\n\n" "$FOUND"
         OK_COUNT=$((OK_COUNT + 1))
         continue
       fi
     fi
     status_line "*" "$RED" "Check $REL" "!!" "$RED"
     finish_line
-    printf "%b*%b Файл не найден в назначении:\n" "$RED" "$RESET"
+    printf "%b*%b File not found in destination:\n" "$RED" "$RESET"
     printf "    %s\n\n" "$FILE2"
     ERR_COUNT=$((ERR_COUNT + 1))
     continue
@@ -354,13 +354,13 @@ for ((INDEX = 0; INDEX < TOTAL; INDEX++)); do
     stop_spinner
     status_line "*" "$RED" "Check $REL" "!!" "$RED"
     finish_line
-    printf "%b*%b Содержимое файлов отличается.\n" "$RED" "$RESET"
-    printf "%b*%b Файл может быть повреждён или изменён.\n" "$RED" "$RESET"
-    printf "    Источник    : %s\n" "$FILE1"
-    printf "    Назначение  : %s\n\n" "$FILE2"
+    printf "%b*%b File contents differ.\n" "$RED" "$RESET"
+    printf "%b*%b The file may be corrupted or modified.\n" "$RED" "$RESET"
+    printf "    Source      : %s\n" "$FILE1"
+    printf "    Destination : %s\n\n" "$FILE2"
     ERR_COUNT=$((ERR_COUNT + 1))
   fi
 done
 
-printf "\n%b*%b Проверка завершена.\n" "$GREEN" "$RESET"
-printf "%b*%b OK: %d  Ошибок: %d\n" "$BLUE" "$RESET" "$OK_COUNT" "$ERR_COUNT"
+printf "\n%b*%b Verification finished.\n" "$GREEN" "$RESET"
+printf "%b*%b OK: %d  Errors: %d\n" "$BLUE" "$RESET" "$OK_COUNT" "$ERR_COUNT"
