@@ -243,7 +243,6 @@ stop_spinner() {
 # Ctrl+C / Ctrl+Z handling #
 ############################
 INTERRUPTED=false
-
 on_interrupt() {
   if $INTERRUPTED; then
     stop_spinner
@@ -252,21 +251,15 @@ on_interrupt() {
   fi
 
   INTERRUPTED=true
-
   stop_spinner
 
-  echo
-  echo "Press Ctrl+C again to abort immediately..."
+  # Считаем, сколько файлов осталось проверить
+  UNCHECKED_COUNT=$((TOTAL - INDEX))
 
-  local j rel
-  for ((j = INDEX; j < TOTAL; j++)); do
-    rel="${FILES[j]#$DIR1/}"
-
-    status_line "*" "$YELLOW" "Check $rel" "unchecked" "$YELLOW"
-    finish_line
-
-    UNCHECKED_COUNT=$((UNCHECKED_COUNT + 1))
-  done
+  clear_status
+  # Выводим компактный статус вида: [ 141/1156 unchecked ]
+  status_line "*" "$YELLOW" "Verification interrupted" "${UNCHECKED_COUNT}/${TOTAL} unchecked" "$YELLOW"
+  finish_line
 
   printf "\n%b*%b Interrupted by user.\n" "$RED" "$RESET"
   printf "%b*%b OK: %d  Errors: %d  Unchecked: %d\n" \
