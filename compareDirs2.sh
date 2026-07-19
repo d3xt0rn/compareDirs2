@@ -242,20 +242,40 @@ stop_spinner() {
 ############################
 # Ctrl+C / Ctrl+Z handling #
 ############################
+INTERRUPTED=false
+
 on_interrupt() {
+  if $INTERRUPTED; then
+    stop_spinner
+    printf "\n%b*%b Force exit.\n" "$RED" "$RESET"
+    exit 130
+  fi
+
+  INTERRUPTED=true
+
   stop_spinner
+
+  echo
+  echo "Press Ctrl+C again to abort immediately..."
+
   local j rel
   for ((j = INDEX; j < TOTAL; j++)); do
     rel="${FILES[j]#$DIR1/}"
+
     status_line "*" "$YELLOW" "Check $rel" "unchecked" "$YELLOW"
     finish_line
+
     UNCHECKED_COUNT=$((UNCHECKED_COUNT + 1))
   done
+
   printf "\n%b*%b Interrupted by user.\n" "$RED" "$RESET"
   printf "%b*%b OK: %d  Errors: %d  Unchecked: %d\n" \
-    "$BLUE" "$RESET" "$OK_COUNT" "$ERR_COUNT" "$UNCHECKED_COUNT"
+    "$BLUE" "$RESET" \
+    "$OK_COUNT" "$ERR_COUNT" "$UNCHECKED_COUNT"
+
   exit 130
 }
+
 trap on_interrupt SIGINT SIGTSTP
 
 ############################
