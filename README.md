@@ -4,10 +4,10 @@ A recursive directory comparison tool for Bash, styled after **OpenRC**'s
 service-status output (`* Checking foo ... [ ok ]`).
 
 It walks every file in `DIR1` and checks whether an identical file exists at
-the same relative path in `DIR2` — either byte-for-byte (`cmp`) or by hash —
-with a live spinner, color-coded results, and optional rename detection.
--# screenshot:
-    [[.assets/screenshot.png]]
+the same relative path in `DIR2` — either byte-for-byte (`cmp`) or by hash — 
+with a live spinner, color-coded results, and optional rename detection. <br>
+screenshot:
+    ![screenshot](.assets/screenshot.png)
 
 ## Features
 
