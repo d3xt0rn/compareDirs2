@@ -21,12 +21,13 @@ WHITE='\033[1;37m'
 SPINNER=("/" "-" "\\" "|")
 
 ############################
-# Defaults / options       #
+# Defaults / options        #
 ############################
 HASH_MODE=false
 HASH_ALGO="sha256sum"
 MIN_SIZE=0
 MAX_SIZE=0
+MAX_FIND_TIME=0
 FIND_RENAMED=false
 DIR1=""
 DIR2=""
@@ -38,17 +39,97 @@ usage() {
 Usage: $0 [OPTIONS] DIR1 DIR2
 
 Options:
-  -x, --hash              Compare files by hash instead of byte-for-byte cmp
-  -a, --algo ALGO         Hash algorithm: md5sum|sha1sum|sha256sum|sha512sum|b2sum
-                          (default: sha256sum)
-      --min-size BYTES    Only hash-compare files >= BYTES
-                          (smaller files use cmp)
-      --max-size BYTES    Only hash-compare files <= BYTES
-                          (larger files use cmp)
-  -r, --find-renamed      If a file is missing in DIR2 — search DIR2 for a
-                          file with identical content/hash (rename detection)
-  -h, --help              Show this help
+  -x, --hash           Compare files by hash instead of byte-for-byte cmp
+  -a, --algo ALGO      Hash algorithm: md5sum|sha1sum|sha256sum|sha512sum|b2sum
+                       (default: sha256sum)
+      --min-size SIZE  Only hash-compare files >= SIZE (e.g., 500b, 2kb, 10mib, 1gb)
+                       (smaller files use cmp)
+      --max-size SIZE  Only hash-compare files <= SIZE (e.g., 100mb, 2gib)
+                       (larger files use cmp)
+      --max-find-time T Max time allowed for find search per file (e.g., 5s, 2m, 1h)
+  -r, --find-renamed   If a file is missing in DIR2 — search DIR2 for a
+                       file with identical content/hash (rename detection)
+  -h, --help           Show this help
 EOF
+}
+
+############################
+# Parsers (Size & Time)    #
+############################
+
+# Конвертирует человекочитаемый размер в байты
+parse_size() {
+  local val="$1"
+  # Приводим к нижнему регистру для простоты парсинга
+  local clean=$(echo "$val" | tr '[:upper:]' '[:lower:]' | xargs)
+
+  # Проверяем, если это чистое число
+  if [[ "$clean" =~ ^[0-9]+$ ]]; then
+    echo "$clean"
+    return 0
+  fi
+
+  # Регулярное выражение для разделения числа и суффикса
+  if [[ "$clean" =~ ^([0-9]+)([a-z]+)$ ]]; then
+    local num="${BASH_REMATCH[1]}"
+    local unit="${BASH_REMATCH[2]}"
+    local factor=1
+
+    case "$unit" in
+    b) factor=1 ;;
+    k | kb) factor=1000 ;;
+    m | mb) factor=1000000 ;;
+    g | gb) factor=1000000000 ;;
+    t | tb) factor=100000000000 ;;
+    p | pb) factor=100000000000000 ;;
+    ki | kib) factor=1024 ;;
+    mi | mib) factor=1048576 ;;
+    gi | gib) factor=1073741824 ;;
+    ti | tib) factor=1099511627776 ;;
+    pi | pib) factor=1125899906842624 ;;
+    *)
+      echo "Ошибка: Неизвестный суффикс размера '$unit' в параметре '$val'" >&2
+      exit 1
+      ;;
+    esac
+    echo $((num * factor))
+  else
+    echo "Ошибка: Неверный формат размера '$val'" >&2
+    exit 1
+  fi
+}
+
+# Конвертирует человекочитаемое время в секунды
+parse_time() {
+  local val="$1"
+  local clean=$(echo "$val" | tr '[:upper:]' '[:lower:]' | xargs)
+
+  if [[ "$clean" =~ ^[0-9]+$ ]]; then
+    echo "$clean"
+    return 0
+  fi
+
+  if [[ "$clean" =~ ^([0-9]+)([a-z]+)$ ]]; then
+    local num="${BASH_REMATCH[1]}"
+    local unit="${BASH_REMATCH[2]}"
+    local factor=1
+
+    case "$unit" in
+    s) factor=1 ;;
+    m) factor=60 ;;
+    h) factor=3600 ;;
+    d) factor=86400 ;;
+    w) factor=604800 ;;
+    *)
+      echo "Ошибка: Неизвестный суффикс времени '$unit' в параметре '$val'" >&2
+      exit 1
+      ;;
+    esac
+    echo $((num * factor))
+  else
+    echo "Ошибка: Неверный формат времени '$val'" >&2
+    exit 1
+  fi
 }
 
 ############################
@@ -70,11 +151,15 @@ while [[ $# -gt 0 ]]; do
     shift 2
     ;;
   --min-size)
-    MIN_SIZE="$2"
+    MIN_SIZE=$(parse_size "$2")
     shift 2
     ;;
   --max-size)
-    MAX_SIZE="$2"
+    MAX_SIZE=$(parse_size "$2")
+    shift 2
+    ;;
+  --max-find-time)
+    MAX_FIND_TIME=$(parse_time "$2")
     shift 2
     ;;
   -r | --find-renamed)
@@ -136,7 +221,6 @@ fi
 # Terminal / Status column #
 ############################
 TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
-# width is refreshed on terminal resize, no extra tput forks per frame
 trap 'TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)' WINCH
 
 OK_COUNT=0
@@ -146,13 +230,12 @@ SPID=""
 INDEX=0
 TOTAL=0
 FILES=()
-LAST_LINES=1 # how many lines the current in-progress status occupies (1 or 2)
+LAST_LINES=1
 
 filesize() {
   stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
 }
 
-# clears the previous status output (accounting for 2-line wrap)
 clear_status() {
   if ((LAST_LINES > 1)); then
     printf '\033[%dA' "$((LAST_LINES - 1))"
@@ -160,29 +243,20 @@ clear_status() {
   printf '\r\033[J'
 }
 
-# closes the current status with a real newline and resets state
 finish_line() {
   echo
   LAST_LINES=1
 }
 
-# status_line PREFIX PREFIX_COLOR MESSAGE STATUS STATUS_COLOR
-#
-# Depending on terminal width:
-#   - fits entirely  -> single line, as usual
-#   - the name fits but the status on the right doesn't -> status wraps
-#     to the next line with indentation
-#   - even the name doesn't fit -> name is truncated from the front ("...tail")
 status_line() {
   local prefix="$1" pcolor="$2" msg="$3" status="$4" scolor="$5"
   local status_len=${#status}
-  local fixed=$((status_len + 6)) # "* " + "[ " + status + " ]"
+  local fixed=$((status_len + 6))
   local msglen=${#msg}
 
   clear_status
 
   if ((TERM_WIDTH >= msglen + fixed + 2)); then
-    # everything fits on one line
     local pad=$((TERM_WIDTH - msglen - fixed))
     ((pad < 1)) && pad=1
     printf "%b%s%b %s%*s%b[%b %b%s%b %b]%b" \
@@ -193,7 +267,6 @@ status_line() {
       "$BLUE" "$RESET"
     LAST_LINES=1
   elif ((TERM_WIDTH >= msglen + 2)); then
-    # the name fits, wrap the status to the next line with indentation
     printf "%b%s%b %s\n" "$pcolor" "$prefix" "$RESET" "$msg"
     printf "    %b[%b %b%s%b %b]%b" \
       "$BLUE" "$RESET" \
@@ -201,7 +274,6 @@ status_line() {
       "$BLUE" "$RESET"
     LAST_LINES=2
   else
-    # terminal is too narrow — truncate the name from the front
     local maxmsg=$((TERM_WIDTH - fixed - 2))
     ((maxmsg < 5)) && maxmsg=5
     if ((msglen > maxmsg)); then
@@ -220,12 +292,16 @@ status_line() {
   fi
 }
 
-# spinner MESSAGE COLOR
+# Спиннер принимает дополнительный режим для кастомизации вывода статуса
 spinner() {
-  local msg="$1" color="$2"
+  local msg="$1" color="$2" mode="${3:-default}"
   while :; do
     for c in "${SPINNER[@]}"; do
-      status_line " " "$RESET" "$msg" "$c" "$color"
+      if [[ "$mode" == "finding" ]]; then
+        status_line " " "$RESET" "$msg" "finding $c" "$color"
+      else
+        status_line " " "$RESET" "$msg" "$c" "$color"
+      fi
       sleep 0.08
     done
   done
@@ -253,11 +329,9 @@ on_interrupt() {
   INTERRUPTED=true
   stop_spinner
 
-  # Считаем, сколько файлов осталось проверить
   UNCHECKED_COUNT=$((TOTAL - INDEX))
 
   clear_status
-  # Выводим компактный статус вида: [ 141/1156 unchecked ]
   status_line "*" "$YELLOW" "Verification interrupted" "${UNCHECKED_COUNT}/${TOTAL} unchecked" "$YELLOW"
   finish_line
 
@@ -293,11 +367,22 @@ compare_files() {
   cmp -s "$f1" "$f2"
 }
 
-# find_renamed FILE1 -> prints the found file path to stdout, returns 0/1
+# find_renamed FILE1 -> ищет дубликат с учетом таймаута
 find_renamed() {
   local f1="$1" cand target_sum=""
+  local start_time=$(date +%s)
+
   $HASH_MODE && target_sum="$(hash_of "$f1")"
+
   while IFS= read -r -d '' cand; do
+    # Проверка ограничения по времени поиска
+    if ((MAX_FIND_TIME > 0)); then
+      local current_time=$(date +%s)
+      if ((current_time - start_time >= MAX_FIND_TIME)); then
+        return 1
+      fi
+    fi
+
     if $HASH_MODE; then
       [[ "$(hash_of "$cand")" == "$target_sum" ]] && {
         printf '%s' "$cand"
@@ -332,7 +417,8 @@ for ((INDEX = 0; INDEX < TOTAL; INDEX++)); do
   #########################################
   if [[ ! -f "$FILE2" ]]; then
     if $FIND_RENAMED; then
-      spinner "Find $REL" "$CYAN" &
+      # Вызываем спиннер с флагом "finding" для вывода [ finding / ]
+      spinner "Find $REL" "$CYAN" "finding" &
       SPID=$!
       FOUND="$(find_renamed "$FILE1" || true)"
       stop_spinner
