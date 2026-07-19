@@ -11,7 +11,7 @@ screenshot:
 
 ## Features
 
-- OpenRC-style status lines with a spinning cursor (`/ - \ |`) while a file
+- **OpenRC-style** status lines with a spinning cursor (`/ - \ |`) while a file
   is being checked.
 - Byte-for-byte comparison by default (`cmp`), or hash-based comparison
   (`md5sum`, `sha1sum`, `sha256sum`, `sha512sum`, `b2sum`).
