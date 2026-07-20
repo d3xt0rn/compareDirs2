@@ -15,7 +15,7 @@ file exists at the same relative path in `DIR2` — either byte-for-byte
 (`cmp`-style) or by hash — with a live spinner (or a single-line progress
 bar), color-coded results, and optional rename/move detection.
 
-> [!important]
+> [!warning]
 > This is a **100% vibe-coded** project. It works, it's been used, but it
 > hasn't been formally audited — read the source before trusting it with
 > anything you can't afford to lose.
