@@ -1,9 +1,9 @@
-// compare_dirs.rs
+// compareDirs2.rs
 //
 // Rust port of compareDirs2.sh
 //
 // Compare all files in DIR1 with DIR2 recursively.
-// Styled after OpenRC.
+// Styled after OpenRC / emerge.
 
 use clap::Parser;
 use digest::Digest;
@@ -37,8 +37,10 @@ const SPINNER: [&str; 4] = ["/", "-", "\\", "|"];
 #[derive(Parser, Debug)]
 #[command(
     name = "compare_dirs",
+    version,
     about = "Compare all files in DIR1 with DIR2 recursively.",
-    disable_help_flag = true
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct RawArgs {
     #[arg(short = 'x', long = "hash")]
@@ -59,8 +61,39 @@ struct RawArgs {
     #[arg(short = 'r', long = "find-renamed")]
     find_renamed: bool,
 
+    /// Show a single-line emerge-style progress bar instead of a per-file spinner
+    #[arg(short = 'p', long = "progress")]
+    progress: bool,
+
+    /// Number of parallel worker threads (0 = auto/num CPUs, default: 1)
+    #[arg(short = 'j', long = "jobs")]
+    jobs: Option<usize>,
+
+    /// Only print errors and the final summary
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+
+    /// Always print full paths instead of paths relative to DIR1
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
+
+    /// Follow symlinks while walking directories
+    #[arg(short = 'L', long = "follow-symlinks")]
+    follow_symlinks: bool,
+
+    /// Skip paths whose relative name contains SUBSTR (repeatable)
+    #[arg(long = "exclude", value_name = "SUBSTR")]
+    exclude: Vec<String>,
+
+    /// Don't check anything, only list what would be checked
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+
     #[arg(short = 'h', long = "help", action = clap::ArgAction::SetTrue)]
     help: bool,
+
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::SetTrue)]
+    version: bool,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     positional: Vec<String>,
@@ -71,17 +104,27 @@ fn usage(prog: &str) {
         r#"Usage: {prog} [OPTIONS] DIR1 DIR2
 
 Options:
-  -x, --hash           Compare files by hash instead of byte-for-byte cmp
-  -a, --algo ALGO      Hash algorithm: md5sum|sha1sum|sha256sum|sha512sum|b2sum
-                       (default: sha256sum)
-      --min-size SIZE  Only hash-compare files >= SIZE (e.g., 500B, 2KB, 10MiB, 1GB)
-                       (smaller files use cmp)
-      --max-size SIZE  Only hash-compare files <= SIZE (e.g., 100MB, 2GiB)
-                       (larger files use cmp)
-      --max-find-time T Max time allowed for find search per file (e.g., 5s, 2m, 1h)
-  -r, --find-renamed   If a file is missing in DIR2 — search DIR2 for a
-                       file with identical content/hash (rename detection)
-  -h, --help           Show this help
+  -x, --hash              Compare files by hash instead of byte-for-byte cmp
+  -a, --algo ALGO         Hash algorithm (default: sha256sum). One of:
+                           md5sum, sha1sum, sha256sum, sha512sum,
+                           sha3-256sum, sha3-512sum, b2sum, b3sum,
+                           xxh32sum, xxh64sum, xxh3sum, crc32sum
+      --min-size SIZE      Only hash-compare files >= SIZE (e.g., 500B, 2KB, 10MiB, 1GB)
+                           (smaller files use cmp)
+      --max-size SIZE      Only hash-compare files <= SIZE (e.g., 100MB, 2GiB)
+                           (larger files use cmp)
+      --max-find-time T    Max time allowed for find search per file (e.g., 5s, 2m, 1h)
+  -r, --find-renamed       If a file is missing in DIR2 — search DIR2 for a
+                           file with identical content/hash (rename detection)
+  -p, --progress           Show a single-line emerge-style progress bar
+  -j, --jobs N             Parallel worker threads (0 = auto, default: 1)
+  -q, --quiet              Only print errors and the final summary
+  -v, --verbose            Always print full paths instead of relative paths
+  -L, --follow-symlinks    Follow symlinks while walking directories
+      --exclude SUBSTR     Skip paths containing SUBSTR (repeatable)
+      --dry-run            List what would be checked, then exit
+  -h, --help               Show this help
+  -V, --version            Show version information
 "#
     );
 }
@@ -90,7 +133,7 @@ Options:
 // Parsers (Size & Time)    //
 //////////////////////////////
 
-// Converts human-readable size to bytes (mirrors the bash parse_size, bugs included)
+// Converts human-readable size to bytes.
 fn parse_size(val: &str) -> Result<u64, String> {
     let clean = val.trim().to_lowercase();
 
@@ -113,13 +156,15 @@ fn parse_size(val: &str) -> Result<u64, String> {
             .parse()
             .map_err(|_| format!("Error: Invalid size format '{val}'"))?;
 
+        // NOTE: bugfix vs. the original bash script — tb/pb used to use
+        // 10^11 / 10^14 (a copy-paste bug). Now correct decimal SI factors.
         let factor: u64 = match unit {
             "b" => 1,
             "k" | "kb" => 1_000,
             "m" | "mb" => 1_000_000,
             "g" | "gb" => 1_000_000_000,
-            "t" | "tb" => 100_000_000_000, // matches original script's value
-            "p" | "pb" => 100_000_000_000_000, // matches original script's value
+            "t" | "tb" => 1_000_000_000_000,
+            "p" | "pb" => 1_000_000_000_000_000,
             "ki" | "kib" => 1_024,
             "mi" | "mib" => 1_048_576,
             "gi" | "gib" => 1_073_741_824,
@@ -131,7 +176,8 @@ fn parse_size(val: &str) -> Result<u64, String> {
                 ))
             }
         };
-        Ok(num * factor)
+        num.checked_mul(factor)
+            .ok_or_else(|| format!("Error: Size '{val}' overflows u64"))
     } else {
         Err(format!("Error: Invalid size format '{val}'"))
     }
@@ -172,7 +218,8 @@ fn parse_time(val: &str) -> Result<u64, String> {
                 ))
             }
         };
-        Ok(num * factor)
+        num.checked_mul(factor)
+            .ok_or_else(|| format!("Error: Time '{val}' overflows u64"))
     } else {
         Err(format!("Error: Invalid time format '{val}'"))
     }
@@ -188,23 +235,50 @@ enum HashAlgo {
     Sha1,
     Sha256,
     Sha512,
+    Sha3_256,
+    Sha3_512,
     Blake2b,
+    Blake3,
+    Xxh32,
+    Xxh64,
+    Xxh3,
+    Crc32,
 }
 
 impl HashAlgo {
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "md5sum" => Some(HashAlgo::Md5),
-            "sha1sum" => Some(HashAlgo::Sha1),
-            "sha256sum" => Some(HashAlgo::Sha256),
-            "sha512sum" => Some(HashAlgo::Sha512),
-            "b2sum" => Some(HashAlgo::Blake2b),
+            "md5sum" | "md5" => Some(HashAlgo::Md5),
+            "sha1sum" | "sha1" => Some(HashAlgo::Sha1),
+            "sha256sum" | "sha256" => Some(HashAlgo::Sha256),
+            "sha512sum" | "sha512" => Some(HashAlgo::Sha512),
+            "sha3-256sum" | "sha3-256" => Some(HashAlgo::Sha3_256),
+            "sha3-512sum" | "sha3-512" => Some(HashAlgo::Sha3_512),
+            "b2sum" | "blake2b" => Some(HashAlgo::Blake2b),
+            "b3sum" | "blake3" => Some(HashAlgo::Blake3),
+            "xxh32sum" | "xxh32" => Some(HashAlgo::Xxh32),
+            "xxh64sum" | "xxh64" => Some(HashAlgo::Xxh64),
+            "xxh3sum" | "xxh3" => Some(HashAlgo::Xxh3),
+            "crc32sum" | "crc32" => Some(HashAlgo::Crc32),
             _ => None,
         }
     }
 }
 
-const ALLOWED_ALGOS: [&str; 5] = ["md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum"];
+const ALLOWED_ALGOS: [&str; 12] = [
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "sha3-256sum",
+    "sha3-512sum",
+    "b2sum",
+    "b3sum",
+    "xxh32sum",
+    "xxh64sum",
+    "xxh3sum",
+    "crc32sum",
+];
 
 fn hash_of(path: &Path, algo: HashAlgo) -> io::Result<String> {
     let file = File::open(path)?;
@@ -230,7 +304,64 @@ fn hash_of(path: &Path, algo: HashAlgo) -> io::Result<String> {
         HashAlgo::Sha1 => digest_loop!(sha1::Sha1::new()),
         HashAlgo::Sha256 => digest_loop!(sha2::Sha256::new()),
         HashAlgo::Sha512 => digest_loop!(sha2::Sha512::new()),
+        HashAlgo::Sha3_256 => digest_loop!(sha3::Sha3_256::new()),
+        HashAlgo::Sha3_512 => digest_loop!(sha3::Sha3_512::new()),
         HashAlgo::Blake2b => digest_loop!(blake2::Blake2b512::new()),
+        HashAlgo::Blake3 => {
+            let mut hasher = blake3::Hasher::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            hasher.finalize().to_hex().to_string()
+        }
+        HashAlgo::Xxh32 => {
+            let mut hasher = xxhash_rust::xxh32::Xxh32::new(0);
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:08x}", hasher.digest())
+        }
+        HashAlgo::Xxh64 => {
+            let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:016x}", hasher.digest())
+        }
+        HashAlgo::Xxh3 => {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:016x}", hasher.digest())
+        }
+        HashAlgo::Crc32 => {
+            let mut hasher = crc32fast::Hasher::new();
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:08x}", hasher.finalize())
+        }
     };
     Ok(hex)
 }
@@ -318,33 +449,15 @@ impl Status {
             let pad = (term_w as i64 - msglen as i64 - fixed as i64).max(1) as usize;
             let _ = write!(
                 out,
-                "{pcolor}{prefix}{RESET} {msg}{pad}{blue}[{RESET} {scolor}{status}{RESET} {blue}]{RESET}",
-                pcolor = pcolor,
-                prefix = prefix,
-                RESET = RESET,
-                msg = msg,
+                "{pcolor}{prefix}{RESET} {msg}{pad}{BLUE}[{RESET} {scolor}{status}{RESET} {BLUE}]{RESET}",
                 pad = " ".repeat(pad),
-                blue = BLUE,
-                scolor = scolor,
-                status = status,
             );
             self.last_lines = 1;
         } else if term_w >= msglen + 2 {
-            let _ = writeln!(
-                out,
-                "{pcolor}{prefix}{RESET} {msg}",
-                pcolor = pcolor,
-                prefix = prefix,
-                RESET = RESET,
-                msg = msg
-            );
+            let _ = writeln!(out, "{pcolor}{prefix}{RESET} {msg}");
             let _ = write!(
                 out,
-                "    {blue}[{RESET} {scolor}{status}{RESET} {blue}]{RESET}",
-                blue = BLUE,
-                RESET = RESET,
-                scolor = scolor,
-                status = status,
+                "    {BLUE}[{RESET} {scolor}{status}{RESET} {BLUE}]{RESET}"
             );
             self.last_lines = 2;
         } else {
@@ -361,18 +474,57 @@ impl Status {
             let pad = (term_w as i64 - msglen as i64 - fixed as i64).max(1) as usize;
             let _ = write!(
                 out,
-                "{pcolor}{prefix}{RESET} {msg}{pad}{blue}[{RESET} {scolor}{status}{RESET} {blue}]{RESET}",
-                pcolor = pcolor,
-                prefix = prefix,
-                RESET = RESET,
-                msg = msg,
+                "{pcolor}{prefix}{RESET} {msg}{pad}{BLUE}[{RESET} {scolor}{status}{RESET} {BLUE}]{RESET}",
                 pad = " ".repeat(pad),
-                blue = BLUE,
-                scolor = scolor,
-                status = status,
             );
             self.last_lines = 1;
         }
+        let _ = out.flush();
+    }
+
+    /// Emerge-style single-line progress bar:
+    /// " * Checking (12 of 340) [#####-------] 35%  some/file.txt"
+    fn progress_line(&mut self, index: usize, total: usize, err: usize, file: &str) {
+        let term_w = term_width();
+        self.clear();
+        let mut out = io::stdout();
+
+        let done = index.min(total);
+        let pct = if total == 0 {
+            100
+        } else {
+            (done * 100) / total
+        };
+
+        let counter = format!("({done} of {total})");
+        let pct_s = format!("{pct:>3}%");
+        let errs = format!(" err:{err}");
+        let reserved = 3 + counter.len() + 3 + pct_s.len() + errs.len() + 4;
+        let bar_width = (term_w.saturating_sub(reserved)).clamp(10, 40);
+        let filled = if total == 0 {
+            bar_width
+        } else {
+            (bar_width * done) / total
+        };
+        let bar: String = "#".repeat(filled) + &"-".repeat(bar_width - filled);
+
+        let name_budget = term_w.saturating_sub(reserved + bar_width + 3);
+        let mut name = file.to_string();
+        if name.chars().count() > name_budget && name_budget > 3 {
+            let chars: Vec<char> = name.chars().collect();
+            let tail_len = name_budget.saturating_sub(3);
+            let tail: String = chars[chars.len().saturating_sub(tail_len)..]
+                .iter()
+                .collect();
+            name = format!("...{tail}");
+        }
+
+        let ecolor = if err > 0 { RED } else { GREEN };
+        let _ = write!(
+            out,
+            "{GREEN}*{RESET} Checking {counter} {BLUE}[{RESET}{CYAN}{bar}{RESET}{BLUE}]{RESET} {pct_s} {ecolor}{errs}{RESET}  {name}"
+        );
+        self.last_lines = 1;
         let _ = out.flush();
     }
 }
@@ -397,6 +549,10 @@ fn start_spinner(
     let join = thread::spawn(move || {
         let mut i = 0usize;
         while !stop_flag_thread.load(Ordering::Relaxed) {
+            if PAUSED.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(80));
+                continue;
+            }
             let c = SPINNER[i % SPINNER.len()];
             let label = if finding {
                 format!("finding {c}")
@@ -426,7 +582,7 @@ fn stop_spinner(mut handle: SpinnerHandle) {
 
 //////////////////////////////
 // Global counters (for the //
-// Ctrl+C handler)          //
+// Ctrl+C / Ctrl+Z handler) //
 //////////////////////////////
 
 static OK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -434,11 +590,16 @@ static ERR_COUNT: AtomicUsize = AtomicUsize::new(0);
 static INDEX: AtomicUsize = AtomicUsize::new(0);
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+// Set while the process is (about to be) suspended via Ctrl+Z, so worker /
+// spinner threads stop touching the terminal instead of racing the shell
+// when the job is later resumed with `fg`.
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
 //////////////////////////////
 // Compare logic             //
 //////////////////////////////
 
+#[derive(Clone)]
 struct CompareOpts {
     hash_mode: bool,
     algo: HashAlgo,
@@ -477,6 +638,9 @@ fn find_renamed(dir2: &Path, f1: &Path, opts: &CompareOpts, max_find_time: u64) 
         if max_find_time > 0 && start.elapsed() >= Duration::from_secs(max_find_time) {
             return None;
         }
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return None;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -495,8 +659,60 @@ fn find_renamed(dir2: &Path, f1: &Path, opts: &CompareOpts, max_find_time: u64) 
 }
 
 //////////////////////////////
-// Ctrl+C handling           //
+// Per-file check result     //
 //////////////////////////////
+
+enum CheckResult {
+    Ok,
+    Renamed(PathBuf),
+    Missing,
+    Differ,
+}
+
+fn check_one(
+    file1: &Path,
+    file2: &Path,
+    opts: &CompareOpts,
+    find_renamed_opt: bool,
+    dir2: &Path,
+    max_find_time: u64,
+) -> CheckResult {
+    if !file2.is_file() {
+        if find_renamed_opt {
+            if let Some(found) = find_renamed(dir2, file1, opts, max_find_time) {
+                return CheckResult::Renamed(found);
+            }
+        }
+        return CheckResult::Missing;
+    }
+    if compare_files(file1, file2, opts) {
+        CheckResult::Ok
+    } else {
+        CheckResult::Differ
+    }
+}
+
+//////////////////////////////
+// Ctrl+C / Ctrl+Z handling  //
+//////////////////////////////
+
+fn print_interrupt_summary(reason: &str, code: i32) {
+    let total = TOTAL.load(Ordering::SeqCst);
+    let index = INDEX.load(Ordering::SeqCst);
+    let unchecked = total.saturating_sub(index);
+
+    print!("\r\x1b[J");
+    print!("{YELLOW}*{RESET} Verification interrupted [{unchecked}/{total} unchecked]\n");
+    print!("\n{RED}*{RESET} {reason}\n");
+    print!(
+        "{BLUE}*{RESET} OK: {}  Errors: {}  Unchecked: {}\n",
+        OK_COUNT.load(Ordering::SeqCst),
+        ERR_COUNT.load(Ordering::SeqCst),
+        unchecked
+    );
+    let _ = io::stdout().flush();
+    exit(code);
+}
 
 fn install_interrupt_handler() {
     ctrlc::set_handler(move || {
@@ -506,25 +722,325 @@ fn install_interrupt_handler() {
             exit(130);
         }
         INTERRUPTED.store(true, Ordering::SeqCst);
-
-        let total = TOTAL.load(Ordering::SeqCst);
-        let index = INDEX.load(Ordering::SeqCst);
-        let unchecked = total.saturating_sub(index);
-
-        // Clear whatever partial status line is on screen and print the summary.
-        print!("\r\x1b[J");
-        print!("{YELLOW}*{RESET} Verification interrupted [{unchecked}/{total} unchecked]\n");
-        print!("\n{RED}*{RESET} Interrupted by user.\n");
-        print!(
-            "{BLUE}*{RESET} OK: {}  Errors: {}  Unchecked: {}\n",
-            OK_COUNT.load(Ordering::SeqCst),
-            ERR_COUNT.load(Ordering::SeqCst),
-            unchecked
-        );
-        let _ = io::stdout().flush();
-        exit(130);
+        print_interrupt_summary("Interrupted by user.", 130);
     })
     .expect("Error setting Ctrl-C handler");
+}
+
+// Ctrl+Z (SIGTSTP) support: letting the default handler suspend the process
+// mid-write (while a spinner/worker thread is touching the terminal)
+// garbles the screen once the shell resumes the job with `fg`/`bg` — this
+// is the "задержки/зависания на ctrl+z" the original script suffered from.
+// We intercept SIGTSTP, tell background threads to stop writing, flush and
+// print a clean status line, *then* actually stop ourselves; on SIGCONT we
+// announce the resume so the next redraw starts from a known-good state.
+#[cfg(unix)]
+fn install_suspend_handler() {
+    use signal_hook::consts::{SIGCONT, SIGTSTP};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGTSTP, SIGCONT]) {
+        Ok(s) => s,
+        Err(_) => return, // best-effort; not fatal if unsupported
+    };
+
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            match sig {
+                SIGTSTP => {
+                    PAUSED.store(true, Ordering::SeqCst);
+                    print!("\r\x1b[J{YELLOW}*{RESET} Paused (Ctrl+Z). Resume with `fg`.\n");
+                    let _ = io::stdout().flush();
+
+                    // Give background threads a moment to notice PAUSED and
+                    // stop writing before we actually suspend, so we don't
+                    // suspend mid-write and tear the terminal state.
+                    thread::sleep(Duration::from_millis(30));
+
+                    unsafe {
+                        raise_sigstop();
+                    }
+                    // Execution resumes here once `fg`/`bg`/SIGCONT arrives.
+                }
+                SIGCONT => {
+                    if PAUSED.swap(false, Ordering::SeqCst) {
+                        print!("{GREEN}*{RESET} Resumed.\n");
+                        let _ = io::stdout().flush();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_suspend_handler() {
+    // Ctrl+Z / SIGTSTP is a Unix concept; nothing to do elsewhere.
+}
+
+#[cfg(unix)]
+unsafe fn raise_sigstop() {
+    extern "C" {
+        fn raise(sig: i32) -> i32;
+    }
+    const SIGSTOP: i32 = 19;
+    raise(SIGSTOP);
+}
+
+//////////////////////////////
+// File collection           //
+//////////////////////////////
+
+fn collect_files(dir1: &Path, follow_symlinks: bool, exclude: &[String]) -> Vec<PathBuf> {
+    WalkDir::new(dir1)
+        .follow_links(follow_symlinks)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            if exclude.is_empty() {
+                return true;
+            }
+            let rel = p.strip_prefix(dir1).unwrap_or(p);
+            let rel_s = rel.to_string_lossy();
+            !exclude.iter().any(|pat| rel_s.contains(pat.as_str()))
+        })
+        .collect()
+}
+
+//////////////////////////////
+// Reporting                //
+//////////////////////////////
+
+fn display_name(dir1: &Path, file1: &Path, verbose: bool) -> String {
+    if verbose {
+        file1.display().to_string()
+    } else {
+        file1
+            .strip_prefix(dir1)
+            .unwrap_or(file1)
+            .display()
+            .to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report(
+    status: &Arc<Mutex<Status>>,
+    result: &CheckResult,
+    rel_str: &str,
+    file1: &Path,
+    file2: &Path,
+    progress: bool,
+    quiet: bool,
+) {
+    match result {
+        CheckResult::Ok => {
+            OK_COUNT.fetch_add(1, Ordering::SeqCst);
+            if !quiet && !progress {
+                let mut st = status.lock().unwrap();
+                st.status_line("*", GREEN, &format!("Check {rel_str}"), "ok", GREEN);
+                st.finish_line();
+            }
+        }
+        CheckResult::Renamed(found_path) => {
+            OK_COUNT.fetch_add(1, Ordering::SeqCst);
+            if !quiet {
+                let mut st = status.lock().unwrap();
+                if !progress {
+                    st.status_line("*", GREEN, &format!("Find {rel_str}"), "found", GREEN);
+                    st.finish_line();
+                }
+                drop(st);
+                println!("{GREEN}*{RESET} Looks like the file was renamed/moved:");
+                println!("    Found as: {}\n", found_path.display());
+            }
+        }
+        CheckResult::Missing => {
+            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
+            let mut st = status.lock().unwrap();
+            if !progress {
+                st.status_line("*", RED, &format!("Check {rel_str}"), "!!", RED);
+                st.finish_line();
+            }
+            drop(st);
+            println!("{RED}*{RESET} File not found in destination:");
+            println!("    {}\n", file2.display());
+        }
+        CheckResult::Differ => {
+            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
+            let mut st = status.lock().unwrap();
+            if !progress {
+                st.status_line("*", RED, &format!("Check {rel_str}"), "!!", RED);
+                st.finish_line();
+            }
+            drop(st);
+            println!("{RED}*{RESET} File contents differ.");
+            println!("{RED}*{RESET} The file may be corrupted or modified.");
+            println!("    Source      : {}", file1.display());
+            println!("    Destination : {}\n", file2.display());
+        }
+    }
+}
+
+//////////////////////////////
+// Sequential run (jobs<=1)  //
+//////////////////////////////
+
+#[allow(clippy::too_many_arguments)]
+fn run_sequential(
+    dir1: &Path,
+    dir2: &Path,
+    files: &[PathBuf],
+    opts: &CompareOpts,
+    find_renamed_opt: bool,
+    max_find_time: u64,
+    status: &Arc<Mutex<Status>>,
+    progress: bool,
+    quiet: bool,
+    verbose: bool,
+) {
+    let total = files.len();
+    for (index, file1) in files.iter().enumerate() {
+        INDEX.store(index, Ordering::SeqCst);
+
+        let rel = file1.strip_prefix(dir1).unwrap_or(file1).to_path_buf();
+        let file2 = dir2.join(&rel);
+        let rel_str = display_name(dir1, file1, verbose);
+
+        let handle = if !progress && !quiet {
+            Some(start_spinner(
+                status.clone(),
+                format!("Checking {rel_str}"),
+                WHITE,
+                false,
+            ))
+        } else {
+            None
+        };
+
+        let result = check_one(file1, &file2, opts, find_renamed_opt, dir2, max_find_time);
+
+        if let Some(h) = handle {
+            stop_spinner(h);
+        }
+
+        if progress {
+            let mut st = status.lock().unwrap();
+            st.progress_line(index + 1, total, ERR_COUNT.load(Ordering::SeqCst), &rel_str);
+        }
+
+        report(status, &result, &rel_str, file1, &file2, progress, quiet);
+    }
+    if progress {
+        println!();
+    }
+    INDEX.store(total, Ordering::SeqCst);
+}
+
+//////////////////////////////
+// Parallel run (jobs>1)     //
+//////////////////////////////
+
+#[allow(clippy::too_many_arguments)]
+fn run_parallel(
+    dir1: &Path,
+    dir2: &Path,
+    files: &[PathBuf],
+    opts: &CompareOpts,
+    find_renamed_opt: bool,
+    max_find_time: u64,
+    status: &Arc<Mutex<Status>>,
+    progress: bool,
+    quiet: bool,
+    verbose: bool,
+    jobs: usize,
+) {
+    let total = files.len();
+    let next_index = Arc::new(AtomicUsize::new(0));
+    // Each slot is filled exactly once by whichever worker claims that index.
+    let slots: Arc<Vec<Mutex<Option<CheckResult>>>> =
+        Arc::new((0..total).map(|_| Mutex::new(None)).collect());
+
+    let dir1_owned = dir1.to_path_buf();
+    let dir2_owned = dir2.to_path_buf();
+    let files_owned = files.to_vec();
+
+    let mut workers = Vec::with_capacity(jobs);
+    for _ in 0..jobs {
+        let next_index = next_index.clone();
+        let slots = slots.clone();
+        let files = files_owned.clone();
+        let dir1c = dir1_owned.clone();
+        let dir2c = dir2_owned.clone();
+        let opts = opts.clone();
+        workers.push(thread::spawn(move || loop {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                return;
+            }
+            while PAUSED.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let i = next_index.fetch_add(1, Ordering::SeqCst);
+            if i >= files.len() {
+                return;
+            }
+            let file1 = &files[i];
+            let rel = file1.strip_prefix(&dir1c).unwrap_or(file1).to_path_buf();
+            let file2 = dir2c.join(&rel);
+            let result = check_one(
+                file1,
+                &file2,
+                &opts,
+                find_renamed_opt,
+                &dir2c,
+                max_find_time,
+            );
+            *slots[i].lock().unwrap() = Some(result);
+        }));
+    }
+
+    // Main thread: drain results strictly in index order so output stays
+    // deterministic even though the workers finish out of order.
+    for i in 0..total {
+        loop {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                for w in workers {
+                    let _ = w.join();
+                }
+                return;
+            }
+            let mut guard = slots[i].lock().unwrap();
+            if let Some(result) = guard.take() {
+                drop(guard);
+
+                INDEX.store(i, Ordering::SeqCst);
+                let file1 = &files[i];
+                let rel = file1.strip_prefix(dir1).unwrap_or(file1).to_path_buf();
+                let file2 = dir2.join(&rel);
+                let rel_str = display_name(dir1, file1, verbose);
+
+                if progress {
+                    let mut st = status.lock().unwrap();
+                    st.progress_line(i + 1, total, ERR_COUNT.load(Ordering::SeqCst), &rel_str);
+                }
+                report(status, &result, &rel_str, file1, &file2, progress, quiet);
+                break;
+            }
+            drop(guard);
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    for w in workers {
+        let _ = w.join();
+    }
+    if progress {
+        println!();
+    }
+    INDEX.store(total, Ordering::SeqCst);
 }
 
 //////////////////////////////
@@ -532,11 +1048,6 @@ fn install_interrupt_handler() {
 //////////////////////////////
 
 fn main() {
-    //////////////////////////////
-    // Warning
-    //////////////////////////////
-    println!("{GREEN}*{RESET} Please wait.");
-
     let prog = std::env::args()
         .next()
         .unwrap_or_else(|| "compare_dirs".to_string());
@@ -546,6 +1057,12 @@ fn main() {
         usage(&prog);
         exit(0);
     }
+    if raw.version {
+        println!("compare_dirs {}", env!("CARGO_PKG_VERSION"));
+        exit(0);
+    }
+
+    println!("{GREEN}*{RESET} Please wait.");
 
     let hash_mode = raw.hash;
     let algo_name = raw.algo;
@@ -570,6 +1087,10 @@ fn main() {
         },
         None => 0,
     };
+    if max_size > 0 && min_size > max_size {
+        eprintln!("Error: --min-size cannot be greater than --max-size");
+        exit(1);
+    }
     let max_find_time = match raw.max_find_time {
         Some(s) => match parse_time(&s) {
             Ok(v) => v,
@@ -610,7 +1131,14 @@ fn main() {
         HashAlgo::Sha256
     };
 
+    let jobs = match raw.jobs {
+        None => 1,
+        Some(0) => num_cpus::get().max(1),
+        Some(n) => n.max(1),
+    };
+
     install_interrupt_handler();
+    install_suspend_handler();
 
     let opts = CompareOpts {
         hash_mode,
@@ -620,81 +1148,51 @@ fn main() {
     };
 
     // Collect files (mirrors `find "$DIR1" -type f`)
-    let files: Vec<PathBuf> = WalkDir::new(&dir1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
+    let files = collect_files(&dir1, raw.follow_symlinks, &raw.exclude);
+
+    if raw.dry_run {
+        println!(
+            "{BLUE}*{RESET} Dry run: {} file(s) would be checked.",
+            files.len()
+        );
+        for f in &files {
+            let rel = f.strip_prefix(&dir1).unwrap_or(f);
+            println!("    {}", rel.display());
+        }
+        exit(0);
+    }
 
     TOTAL.store(files.len(), Ordering::SeqCst);
 
     let status = Arc::new(Mutex::new(Status::new()));
 
-    for (index, file1) in files.iter().enumerate() {
-        INDEX.store(index, Ordering::SeqCst);
-
-        let rel = file1.strip_prefix(&dir1).unwrap_or(file1).to_path_buf();
-        let file2 = dir2.join(&rel);
-        let rel_str = rel.display().to_string();
-
-        //////////////////////////////////////
-        // Missing file
-        //////////////////////////////////////
-        if !file2.is_file() {
-            if find_renamed_opt {
-                let handle = start_spinner(status.clone(), format!("Find {rel_str}"), CYAN, true);
-                let found = find_renamed(&dir2, file1, &opts, max_find_time);
-                stop_spinner(handle);
-
-                if let Some(found_path) = found {
-                    {
-                        let mut st = status.lock().unwrap();
-                        st.status_line("*", GREEN, &format!("Find {rel_str}"), "found", GREEN);
-                        st.finish_line();
-                    }
-                    println!("{GREEN}*{RESET} Looks like the file was renamed/moved:");
-                    println!("    Found as: {}\n", found_path.display());
-                    OK_COUNT.fetch_add(1, Ordering::SeqCst);
-                    continue;
-                }
-            }
-            {
-                let mut st = status.lock().unwrap();
-                st.status_line("*", RED, &format!("Check {rel_str}"), "!!", RED);
-                st.finish_line();
-            }
-            println!("{RED}*{RESET} File not found in destination:");
-            println!("    {}\n", file2.display());
-            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
-            continue;
-        }
-
-        //////////////////////////////////////
-        // Spinner + compare
-        //////////////////////////////////////
-        let handle = start_spinner(status.clone(), format!("Checking {rel_str}"), WHITE, false);
-        let equal = compare_files(file1, &file2, &opts);
-        stop_spinner(handle);
-
-        if equal {
-            let mut st = status.lock().unwrap();
-            st.status_line("*", GREEN, &format!("Check {rel_str}"), "ok", GREEN);
-            st.finish_line();
-            drop(st);
-            OK_COUNT.fetch_add(1, Ordering::SeqCst);
-        } else {
-            {
-                let mut st = status.lock().unwrap();
-                st.status_line("*", RED, &format!("Check {rel_str}"), "!!", RED);
-                st.finish_line();
-            }
-            println!("{RED}*{RESET} File contents differ.");
-            println!("{RED}*{RESET} The file may be corrupted or modified.");
-            println!("    Source      : {}", file1.display());
-            println!("    Destination : {}\n", file2.display());
-            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
-        }
+    if jobs <= 1 {
+        run_sequential(
+            &dir1,
+            &dir2,
+            &files,
+            &opts,
+            find_renamed_opt,
+            max_find_time,
+            &status,
+            raw.progress,
+            raw.quiet,
+            raw.verbose,
+        );
+    } else {
+        run_parallel(
+            &dir1,
+            &dir2,
+            &files,
+            &opts,
+            find_renamed_opt,
+            max_find_time,
+            &status,
+            raw.progress,
+            raw.quiet,
+            raw.verbose,
+            jobs,
+        );
     }
 
     println!("\n{GREEN}*{RESET} Verification finished.");
@@ -703,4 +1201,27 @@ fn main() {
         OK_COUNT.load(Ordering::SeqCst),
         ERR_COUNT.load(Ordering::SeqCst)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_units() {
+        assert_eq!(parse_size("1tb").unwrap(), 1_000_000_000_000);
+        assert_eq!(parse_size("1pb").unwrap(), 1_000_000_000_000_000);
+        assert_eq!(parse_size("1kib").unwrap(), 1024);
+        assert_eq!(parse_size("500b").unwrap(), 500);
+        assert_eq!(parse_size("2mb").unwrap(), 2_000_000);
+        assert!(parse_size("bad").is_err());
+    }
+
+    #[test]
+    fn time_units() {
+        assert_eq!(parse_time("5s").unwrap(), 5);
+        assert_eq!(parse_time("2m").unwrap(), 120);
+        assert_eq!(parse_time("1h").unwrap(), 3600);
+        assert_eq!(parse_time("1w").unwrap(), 604_800);
+    }
 }
