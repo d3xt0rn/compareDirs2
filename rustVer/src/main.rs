@@ -318,7 +318,7 @@ impl Status {
             let pad = (term_w as i64 - msglen as i64 - fixed as i64).max(1) as usize;
             let _ = write!(
                 out,
-                "{pcolor}{prefix}{RESET} {msg}{pad}[{blue}{RESET} {scolor}{status}{RESET} {blue}{RESET}]{RESET}",
+                "{pcolor}{prefix}{RESET} {msg}{pad}{blue}[{RESET} {scolor}{status}{RESET} {blue}]{RESET}",
                 pcolor = pcolor,
                 prefix = prefix,
                 RESET = RESET,
@@ -361,7 +361,7 @@ impl Status {
             let pad = (term_w as i64 - msglen as i64 - fixed as i64).max(1) as usize;
             let _ = write!(
                 out,
-                "{pcolor}{prefix}{RESET} {msg}{pad}[{blue}{RESET} {scolor}{status}{RESET} {blue}{RESET}]{RESET}",
+                "{pcolor}{prefix}{RESET} {msg}{pad}{blue}[{RESET} {scolor}{status}{RESET} {blue}]{RESET}",
                 pcolor = pcolor,
                 prefix = prefix,
                 RESET = RESET,
