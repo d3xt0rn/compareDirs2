@@ -3,13 +3,20 @@ name = "compareDirs2"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "compareDirs2"
+path = "src/main.rs"
+
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
-crossterm = "0.27"
-ctrlc = "3.4"
-walkdir = "2.4"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 blake2 = "0.10"
 digest = "0.10"
+ctrlc = "3"
+terminal_size = "0.3"
+
+[profile.release]
+opt-level = 3
