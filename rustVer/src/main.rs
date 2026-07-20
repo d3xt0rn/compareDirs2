@@ -532,6 +532,11 @@ fn install_interrupt_handler() {
 //////////////////////////////
 
 fn main() {
+    //////////////////////////////
+    // Warning
+    //////////////////////////////
+    println!("{GREEN}*{RESET} Please wait.");
+
     let prog = std::env::args()
         .next()
         .unwrap_or_else(|| "compare_dirs".to_string());
