@@ -89,6 +89,22 @@ struct RawArgs {
     #[arg(long = "dry-run")]
     dry_run: bool,
 
+    /// Disable the on-disk hash cache used to speed up --find-renamed
+    #[arg(long = "no-hash-cache")]
+    no_hash_cache: bool,
+
+    /// Custom path for the hash-cache temp file (default: /tmp/compareDirs2-hashes-<pid>.tsv)
+    #[arg(long = "cache-file", value_name = "PATH")]
+    cache_file: Option<String>,
+
+    /// Keep the hash-cache temp file after the run instead of deleting it
+    #[arg(long = "keep-cache-file")]
+    keep_cache_file: bool,
+
+    /// Print elapsed time and throughput in the final summary
+    #[arg(long = "stats")]
+    stats: bool,
+
     #[arg(short = 'h', long = "help", action = clap::ArgAction::SetTrue)]
     help: bool,
 
@@ -123,6 +139,11 @@ Options:
   -L, --follow-symlinks    Follow symlinks while walking directories
       --exclude SUBSTR     Skip paths containing SUBSTR (repeatable)
       --dry-run            List what would be checked, then exit
+      --no-hash-cache      Disable the on-disk hash cache used by --find-renamed
+      --cache-file PATH    Custom path for the hash-cache temp file
+                           (default: /tmp/compareDirs2-hashes-<pid>.tsv)
+      --keep-cache-file    Keep the hash-cache temp file after the run
+      --stats              Print elapsed time and throughput in the summary
   -h, --help               Show this help
   -V, --version            Show version information
 "#
@@ -222,6 +243,81 @@ fn parse_time(val: &str) -> Result<u64, String> {
             .ok_or_else(|| format!("Error: Time '{val}' overflows u64"))
     } else {
         Err(format!("Error: Invalid time format '{val}'"))
+    }
+}
+
+//////////////////////////////
+// Hash cache (/tmp)         //
+//////////////////////////////
+//
+// find_renamed() re-walks the whole of DIR2 for *every* missing file.
+// Without a cache that means every file in DIR2 gets hashed again from
+// scratch for each missing file — extremely wasteful when several files
+// are missing. HashCache memoizes hash_of() results in memory and mirrors
+// them to a temp file on disk (so state can be inspected/reused), and is
+// removed on normal exit or interruption unless --keep-cache-file is set.
+struct HashCache {
+    enabled: bool,
+    map: Mutex<std::collections::HashMap<PathBuf, String>>,
+    file: Mutex<Option<File>>,
+}
+
+impl HashCache {
+    fn new(enabled: bool, path: Option<&Path>) -> Self {
+        let file = if enabled {
+            path.and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            })
+        } else {
+            None
+        };
+        HashCache {
+            enabled,
+            map: Mutex::new(std::collections::HashMap::new()),
+            file: Mutex::new(file),
+        }
+    }
+
+    /// Returns the hash of `path`, using the cache when enabled.
+    fn hash_of_cached(&self, path: &Path, algo: HashAlgo) -> io::Result<String> {
+        if self.enabled {
+            if let Some(h) = self.map.lock().unwrap().get(path) {
+                return Ok(h.clone());
+            }
+        }
+        let h = hash_of(path, algo)?;
+        if self.enabled {
+            self.map
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), h.clone());
+            if let Some(f) = self.file.lock().unwrap().as_mut() {
+                let _ = writeln!(f, "{}\t{}", path.display(), h);
+            }
+        }
+        Ok(h)
+    }
+}
+
+// Global handle to the cache temp-file path so signal/exit handlers can
+// clean it up regardless of where in the program we are.
+static CACHE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static KEEP_CACHE_FILE: AtomicBool = AtomicBool::new(false);
+
+fn register_cache_path(path: PathBuf) {
+    *CACHE_PATH.lock().unwrap() = Some(path);
+}
+
+fn cleanup_cache_file() {
+    if KEEP_CACHE_FILE.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(p) = CACHE_PATH.lock().unwrap().take() {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -626,49 +722,67 @@ fn compare_files(f1: &Path, f2: &Path, opts: &CompareOpts) -> bool {
     files_equal_bytes(f1, f2).unwrap_or(false)
 }
 
-fn find_renamed(dir2: &Path, f1: &Path, opts: &CompareOpts, max_find_time: u64) -> Option<PathBuf> {
+fn find_renamed(
+    dir2: &Path,
+    f1: &Path,
+    opts: &CompareOpts,
+    max_find_time: u64,
+    cache: &HashCache,
+) -> FindResult {
     let start = Instant::now();
     let target_sum = if opts.hash_mode {
-        hash_of(f1, opts.algo).unwrap_or_default()
+        match hash_of(f1, opts.algo) {
+            Ok(h) => h,
+            Err(_) => return FindResult::NotFound,
+        }
     } else {
         String::new()
     };
 
     for entry in WalkDir::new(dir2).into_iter().filter_map(|e| e.ok()) {
         if max_find_time > 0 && start.elapsed() >= Duration::from_secs(max_find_time) {
-            return None;
+            return FindResult::TimedOut;
         }
         if INTERRUPTED.load(Ordering::SeqCst) {
-            return None;
+            return FindResult::NotFound;
         }
         if !entry.file_type().is_file() {
             continue;
         }
         let cand = entry.path();
         if opts.hash_mode {
-            if let Ok(h) = hash_of(cand, opts.algo) {
+            if let Ok(h) = cache.hash_of_cached(cand, opts.algo) {
                 if h == target_sum {
-                    return Some(cand.to_path_buf());
+                    return FindResult::Found(cand.to_path_buf());
                 }
             }
         } else if files_equal_bytes(f1, cand).unwrap_or(false) {
-            return Some(cand.to_path_buf());
+            return FindResult::Found(cand.to_path_buf());
         }
     }
-    None
+    FindResult::NotFound
 }
 
 //////////////////////////////
 // Per-file check result     //
 //////////////////////////////
 
+enum FindResult {
+    Found(PathBuf),
+    NotFound,
+    TimedOut,
+}
+
 enum CheckResult {
     Ok,
     Renamed(PathBuf),
-    Missing,
+    RenamedNotFound, // search was performed but nothing matched
+    RenamedTimedOut, // search aborted, --max-find-time exceeded
+    Missing,         // --find-renamed not enabled
     Differ,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_one(
     file1: &Path,
     file2: &Path,
@@ -676,16 +790,57 @@ fn check_one(
     find_renamed_opt: bool,
     dir2: &Path,
     max_find_time: u64,
+    cache: &HashCache,
+    status: &Arc<Mutex<Status>>,
+    rel_str: &str,
+    live_ui: bool,
 ) -> CheckResult {
+    let outer = if live_ui {
+        Some(start_spinner(
+            status.clone(),
+            format!("Checking {rel_str}"),
+            WHITE,
+            false,
+        ))
+    } else {
+        None
+    };
+
     if !file2.is_file() {
         if find_renamed_opt {
-            if let Some(found) = find_renamed(dir2, file1, opts, max_find_time) {
-                return CheckResult::Renamed(found);
+            if let Some(h) = outer {
+                stop_spinner(h);
             }
+            let finding_handle = if live_ui {
+                Some(start_spinner(
+                    status.clone(),
+                    format!("Find {rel_str}"),
+                    CYAN,
+                    true,
+                ))
+            } else {
+                None
+            };
+            let result = find_renamed(dir2, file1, opts, max_find_time, cache);
+            if let Some(h) = finding_handle {
+                stop_spinner(h);
+            }
+            return match result {
+                FindResult::Found(p) => CheckResult::Renamed(p),
+                FindResult::NotFound => CheckResult::RenamedNotFound,
+                FindResult::TimedOut => CheckResult::RenamedTimedOut,
+            };
+        }
+        if let Some(h) = outer {
+            stop_spinner(h);
         }
         return CheckResult::Missing;
     }
-    if compare_files(file1, file2, opts) {
+    let eq = compare_files(file1, file2, opts);
+    if let Some(h) = outer {
+        stop_spinner(h);
+    }
+    if eq {
         CheckResult::Ok
     } else {
         CheckResult::Differ
@@ -700,6 +855,8 @@ fn print_interrupt_summary(reason: &str, code: i32) {
     let total = TOTAL.load(Ordering::SeqCst);
     let index = INDEX.load(Ordering::SeqCst);
     let unchecked = total.saturating_sub(index);
+
+    cleanup_cache_file();
 
     print!("\r\x1b[J");
     print!("{YELLOW}*{RESET} Verification interrupted [{unchecked}/{total} unchecked]\n");
@@ -719,6 +876,7 @@ fn install_interrupt_handler() {
         if INTERRUPTED.load(Ordering::SeqCst) {
             print!("\n{RED}*{RESET} Force exit.\n");
             let _ = io::stdout().flush();
+            cleanup_cache_file();
             exit(130);
         }
         INTERRUPTED.store(true, Ordering::SeqCst);
@@ -858,6 +1016,30 @@ fn report(
                 println!("    Found as: {}\n", found_path.display());
             }
         }
+        CheckResult::RenamedNotFound => {
+            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
+            let mut st = status.lock().unwrap();
+            if !progress {
+                st.status_line("*", CYAN, &format!("Find {rel_str}"), "not found", RED);
+                st.finish_line();
+            }
+            drop(st);
+            println!(
+                "{RED}*{RESET} File not found in destination, and no renamed match was found:"
+            );
+            println!("    {}\n", file2.display());
+        }
+        CheckResult::RenamedTimedOut => {
+            ERR_COUNT.fetch_add(1, Ordering::SeqCst);
+            let mut st = status.lock().unwrap();
+            if !progress {
+                st.status_line("*", CYAN, &format!("Find {rel_str}"), "outTime", YELLOW);
+                st.finish_line();
+            }
+            drop(st);
+            println!("{YELLOW}*{RESET} Rename search aborted: --max-find-time exceeded before a match was found.");
+            println!("    {}\n", file2.display());
+        }
         CheckResult::Missing => {
             ERR_COUNT.fetch_add(1, Ordering::SeqCst);
             let mut st = status.lock().unwrap();
@@ -897,12 +1079,14 @@ fn run_sequential(
     opts: &CompareOpts,
     find_renamed_opt: bool,
     max_find_time: u64,
+    cache: &HashCache,
     status: &Arc<Mutex<Status>>,
     progress: bool,
     quiet: bool,
     verbose: bool,
 ) {
     let total = files.len();
+    let live_ui = !progress && !quiet;
     for (index, file1) in files.iter().enumerate() {
         INDEX.store(index, Ordering::SeqCst);
 
@@ -910,22 +1094,18 @@ fn run_sequential(
         let file2 = dir2.join(&rel);
         let rel_str = display_name(dir1, file1, verbose);
 
-        let handle = if !progress && !quiet {
-            Some(start_spinner(
-                status.clone(),
-                format!("Checking {rel_str}"),
-                WHITE,
-                false,
-            ))
-        } else {
-            None
-        };
-
-        let result = check_one(file1, &file2, opts, find_renamed_opt, dir2, max_find_time);
-
-        if let Some(h) = handle {
-            stop_spinner(h);
-        }
+        let result = check_one(
+            file1,
+            &file2,
+            opts,
+            find_renamed_opt,
+            dir2,
+            max_find_time,
+            cache,
+            status,
+            &rel_str,
+            live_ui,
+        );
 
         if progress {
             let mut st = status.lock().unwrap();
@@ -952,6 +1132,7 @@ fn run_parallel(
     opts: &CompareOpts,
     find_renamed_opt: bool,
     max_find_time: u64,
+    cache: &Arc<HashCache>,
     status: &Arc<Mutex<Status>>,
     progress: bool,
     quiet: bool,
@@ -976,6 +1157,8 @@ fn run_parallel(
         let dir1c = dir1_owned.clone();
         let dir2c = dir2_owned.clone();
         let opts = opts.clone();
+        let cache = cache.clone();
+        let status = status.clone();
         workers.push(thread::spawn(move || loop {
             if INTERRUPTED.load(Ordering::SeqCst) {
                 return;
@@ -990,6 +1173,10 @@ fn run_parallel(
             let file1 = &files[i];
             let rel = file1.strip_prefix(&dir1c).unwrap_or(file1).to_path_buf();
             let file2 = dir2c.join(&rel);
+            let rel_str = display_name(&dir1c, file1, verbose);
+            // live_ui=false: with several workers running concurrently a
+            // per-file spinner would tear the shared status line, so the
+            // live "Checking"/"finding" spinner is sequential-mode only.
             let result = check_one(
                 file1,
                 &file2,
@@ -997,6 +1184,10 @@ fn run_parallel(
                 find_renamed_opt,
                 &dir2c,
                 max_find_time,
+                &cache,
+                &status,
+                &rel_str,
+                false,
             );
             *slots[i].lock().unwrap() = Some(result);
         }));
@@ -1063,6 +1254,8 @@ fn main() {
     }
 
     println!("{GREEN}*{RESET} Please wait.");
+
+    let run_start = Instant::now();
 
     let hash_mode = raw.hash;
     let algo_name = raw.algo;
@@ -1166,6 +1359,25 @@ fn main() {
 
     let status = Arc::new(Mutex::new(Status::new()));
 
+    // Hash cache: only useful with --hash + --find-renamed, since that's
+    // the combination that repeatedly re-hashes DIR2. Enabled by default
+    // in that case, disabled otherwise (or if --no-hash-cache is given).
+    let cache_enabled = hash_mode && find_renamed_opt && !raw.no_hash_cache;
+    let cache_path: Option<PathBuf> = if cache_enabled {
+        let p = match &raw.cache_file {
+            Some(custom) => PathBuf::from(custom),
+            None => {
+                std::env::temp_dir().join(format!("compareDirs2-hashes-{}.tsv", std::process::id()))
+            }
+        };
+        register_cache_path(p.clone());
+        KEEP_CACHE_FILE.store(raw.keep_cache_file, Ordering::SeqCst);
+        Some(p)
+    } else {
+        None
+    };
+    let cache = Arc::new(HashCache::new(cache_enabled, cache_path.as_deref()));
+
     if jobs <= 1 {
         run_sequential(
             &dir1,
@@ -1174,6 +1386,7 @@ fn main() {
             &opts,
             find_renamed_opt,
             max_find_time,
+            &cache,
             &status,
             raw.progress,
             raw.quiet,
@@ -1187,6 +1400,7 @@ fn main() {
             &opts,
             find_renamed_opt,
             max_find_time,
+            &cache,
             &status,
             raw.progress,
             raw.quiet,
@@ -1195,12 +1409,24 @@ fn main() {
         );
     }
 
+    cleanup_cache_file();
+
     println!("\n{GREEN}*{RESET} Verification finished.");
     println!(
         "{BLUE}*{RESET} OK: {}  Errors: {}",
         OK_COUNT.load(Ordering::SeqCst),
         ERR_COUNT.load(Ordering::SeqCst)
     );
+    if raw.stats {
+        let elapsed = run_start.elapsed();
+        let secs = elapsed.as_secs_f64().max(0.000_001);
+        let total = TOTAL.load(Ordering::SeqCst);
+        println!(
+            "{BLUE}*{RESET} Elapsed: {:.2}s  ({:.1} files/s)",
+            secs,
+            total as f64 / secs
+        );
+    }
 }
 
 #[cfg(test)]
