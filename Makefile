@@ -10,3 +10,9 @@ run:
 clean:
 	rm -rf ./rustVer/target; rm -rf ./rustVer/compareDirs2; rm -rf ./rustVer/Cargo.lock;
 
+help:
+	@echo "You can run this commands"
+	@echo "make build | build project"
+	@echo "make install | build and install to `$USER.local/bin`"
+	@echo "make run | to run cmd. But i think it can have bugs"
+	@echo "make clean | to clean build dir"
