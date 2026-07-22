@@ -13,6 +13,6 @@ clean:
 help:
 	@echo "You can run this commands"
 	@echo "make build | build project"
-	@echo "make install | build and install to `/home/$$USER/.local/bin`"
+	@echo "make install | build and install to /home/$$USER/.local/bin"
 	@echo "make run | to run cmd. But i think it can have bugs"
 	@echo "make clean | to clean build dir"
