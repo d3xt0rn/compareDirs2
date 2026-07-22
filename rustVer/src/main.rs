@@ -194,7 +194,7 @@ fn parse_size(val: &str) -> Result<u64, String> {
             _ => {
                 return Err(format!(
                     "Error: Unknown size suffix '{unit}' in argument '{val}'"
-                ))
+                ));
             }
         };
         num.checked_mul(factor)
@@ -236,7 +236,7 @@ fn parse_time(val: &str) -> Result<u64, String> {
             _ => {
                 return Err(format!(
                     "Error: Unknown time suffix '{unit}' in argument '{val}'"
-                ))
+                ));
             }
         };
         num.checked_mul(factor)
@@ -1037,7 +1037,9 @@ fn report(
                 st.finish_line();
             }
             drop(st);
-            println!("{YELLOW}*{RESET} Rename search aborted: --max-find-time exceeded before a match was found.");
+            println!(
+                "{YELLOW}*{RESET} Rename search aborted: --max-find-time exceeded before a match was found."
+            );
             println!("    {}\n", file2.display());
         }
         CheckResult::Missing => {
@@ -1159,37 +1161,39 @@ fn run_parallel(
         let opts = opts.clone();
         let cache = cache.clone();
         let status = status.clone();
-        workers.push(thread::spawn(move || loop {
-            if INTERRUPTED.load(Ordering::SeqCst) {
-                return;
+        workers.push(thread::spawn(move || {
+            loop {
+                if INTERRUPTED.load(Ordering::SeqCst) {
+                    return;
+                }
+                while PAUSED.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let i = next_index.fetch_add(1, Ordering::SeqCst);
+                if i >= files.len() {
+                    return;
+                }
+                let file1 = &files[i];
+                let rel = file1.strip_prefix(&dir1c).unwrap_or(file1).to_path_buf();
+                let file2 = dir2c.join(&rel);
+                let rel_str = display_name(&dir1c, file1, verbose);
+                // live_ui=false: with several workers running concurrently a
+                // per-file spinner would tear the shared status line, so the
+                // live "Checking"/"finding" spinner is sequential-mode only.
+                let result = check_one(
+                    file1,
+                    &file2,
+                    &opts,
+                    find_renamed_opt,
+                    &dir2c,
+                    max_find_time,
+                    &cache,
+                    &status,
+                    &rel_str,
+                    false,
+                );
+                *slots[i].lock().unwrap() = Some(result);
             }
-            while PAUSED.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let i = next_index.fetch_add(1, Ordering::SeqCst);
-            if i >= files.len() {
-                return;
-            }
-            let file1 = &files[i];
-            let rel = file1.strip_prefix(&dir1c).unwrap_or(file1).to_path_buf();
-            let file2 = dir2c.join(&rel);
-            let rel_str = display_name(&dir1c, file1, verbose);
-            // live_ui=false: with several workers running concurrently a
-            // per-file spinner would tear the shared status line, so the
-            // live "Checking"/"finding" spinner is sequential-mode only.
-            let result = check_one(
-                file1,
-                &file2,
-                &opts,
-                find_renamed_opt,
-                &dir2c,
-                max_find_time,
-                &cache,
-                &status,
-                &rel_str,
-                false,
-            );
-            *slots[i].lock().unwrap() = Some(result);
         }));
     }
 
